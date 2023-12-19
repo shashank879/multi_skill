@@ -312,7 +312,7 @@ class ImageDecoderSimple(tfutils.Module):
 
 class MLP(tfutils.Module):
 
-  def __init__(self, shape, layers, units, inputs=['tensor'], dims=None, **kw):
+  def __init__(self, shape, layers, units, inputs=['tensor'], dims=None, head_updates=None, **kw):
     assert shape is None or isinstance(shape, (int, tuple, dict)), shape
     if isinstance(shape, int):
       shape = (shape,)
@@ -320,9 +320,10 @@ class MLP(tfutils.Module):
     self._layers = layers
     self._units = units
     self._inputs = Input(inputs, dims=dims)
-    distkeys = ('dist', 'outscale', 'minstd', 'maxstd', 'unimix', 'outnorm')
+    distkeys = ('dist', 'outscale', 'minstd', 'maxstd', 'unimix', 'outnorm', 'temp', 'batch_ndims')
     self._dense = {k: v for k, v in kw.items() if k not in distkeys}
     self._dist = {k: v for k, v in kw.items() if k in distkeys}
+    self._head_updates = head_updates
 
   def __call__(self, inputs):
     feat = self._inputs(inputs)
@@ -341,14 +342,17 @@ class MLP(tfutils.Module):
       raise ValueError(self._shape)
 
   def _out(self, name, shape, x):
-    return self.get(f'dist_{name}', DistLayer, shape, **self._dist)(x)
+    args = self._dist.copy()
+    if self._head_updates and name in self._head_updates:
+      args.update(self._head_updates[name])
+    return self.get(f'dist_{name}', DistLayer, shape, **args)(x)
 
 
 class DistLayer(tfutils.Module):
 
   def __init__(
       self, shape, dist='mse', outscale=0.1, minstd=0.1, maxstd=1.0,
-      unimix=0.0):
+      unimix=0.0, temp=0.5):
     assert all(isinstance(dim, int) for dim in shape), shape
     self._shape = shape
     self._dist = dist
@@ -356,6 +360,7 @@ class DistLayer(tfutils.Module):
     self._maxstd = maxstd
     self._outscale = outscale
     self._unimix = unimix
+    self._temp = temp
 
   def __call__(self, inputs):
     dist = self.inner(inputs)
@@ -412,13 +417,21 @@ class DistLayer(tfutils.Module):
       dist.maxent = np.prod(self._shape) * tfd.Normal(0.0, hi).entropy()
       return dist
     if self._dist == 'onehot':
+      probs = tf.nn.softmax(out, -1)
       if self._unimix:
-        probs = tf.nn.softmax(out, -1)
         uniform = tf.ones_like(probs) / probs.shape[-1]
         probs = (1 - self._unimix) * probs + self._unimix * uniform
         dist = tfutils.OneHotDist(probs=probs)
       else:
         dist = tfutils.OneHotDist(logits=out)
+      if len(self._shape) > 1:
+        dist = tfd.Independent(dist, len(self._shape) - 1)
+      dist.minent = 0.0
+      dist.maxent = np.prod(self._shape[:-1]) * np.log(self._shape[-1])
+      return dist
+    if self._dist == 'relaxed_onehot':
+      probs = tf.nn.softmax(out, -1)
+      dist = tfd.RelaxedOneHotCategorical(self._temp, logits=out)
       if len(self._shape) > 1:
         dist = tfd.Independent(dist, len(self._shape) - 1)
       dist.minent = 0.0

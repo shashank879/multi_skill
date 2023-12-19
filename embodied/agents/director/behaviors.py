@@ -6,6 +6,7 @@ from . import expl
 from . import tfutils
 
 from .hierarchy import Hierarchy  # noqa
+from .gpa_behavior import GPA
 
 
 class Greedy(tfutils.Module):

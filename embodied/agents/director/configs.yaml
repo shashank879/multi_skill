@@ -12,7 +12,7 @@ defaults:
   replay_fixed: {prio_starts: 0.0, prio_ends: 1.0, sync: 0}
   replay_consec: {sync: 0}
   replay_prio: {prio_starts: 0.0, prio_ends: 1.0, sync: 0, fraction: 0.1, softmax: False, temp: 1.0, constant: 0.0, exponent: 0.5}
-  tf: {jit: True, platform: gpu, precision: 16, debug_nans: False, logical_gpus: 0, dist_dataset: False, dist_policy: False, tensorfloat: True, placement: False, growth: True}
+  tf: {jit: True, platform: gpu, precision: 32, debug_nans: False, logical_gpus: 0, dist_dataset: False, dist_policy: False, tensorfloat: True, placement: False, growth: True}
   eval_dir: ''
   filter: '.*'
   tbtt: 0
@@ -37,7 +37,7 @@ defaults:
     sync_every: 180
 
   # Agent
-  task_behavior: Hierarchy
+  task_behavior: GPA
   expl_behavior: None
   batch_size: 16
   transform_rewards: off
@@ -139,6 +139,24 @@ defaults:
   expl_kl: {impl: mult, scale: 0.1, target: 10.0, min: 1e-2, max: 1.0, vel: 0.1}
   expl_vae_elbo: False
 
+  gpa:
+
+    manager:
+      actor_skill_grad: reinforce
+      actor_choice_grad: reinforce
+      choice_entropic_loss: False
+      act_biased_choice: False
+
+    skill_vae:
+      skill_shape: [8, 8]
+      skills: ['T64', 'T32', 'T16']  # List['span', 'var', <int>]
+      train_skill_duration: 8
+      encoder: {layers: 4, units: 512, act: elu, norm: layer, dist: relaxed_onehot, temp: .5, outscale: 0.1, unimix: 0.0, inputs: [context, goal]}
+      decoder: {layers: 4, units: 512, act: elu, norm: layer, dist: mse, outscale: 0.1, inputs: [context, skill]}
+      norm_kl: {impl: mult, scale: 0.0, target: 10.0, min: 1e-5, max: 1.0}
+      opt: {opt: adam, lr: 1e-4, eps: 1e-6, clip: 100.0, wd: 1e-2, wd_pattern: 'kernel'}
+      kl_loss: True
+
 dmlab:
 
   task: dmlab_rooms_collect_good_objects_train
@@ -206,11 +224,12 @@ debug:
     log_timings: False
   batch_size: 8
   replay_size: 500
-  replay_chunk: 12
+  replay_chunk: 16
   encoder.cnn_depth: 16
   decoder.cnn_depth: 16
   rssm: {units: 64, stoch: 8, classes: 8}
   .*\.layers: 2
   .*\.units: 64
   .*\.wd: 0.0
+  .*\.skills: ['T16', 'T8', 'span', 'var']
   tf: {platform: gpu, jit: False}

@@ -98,7 +98,12 @@ def train_with_viz(agent, env, train_replay, eval_replay, logger, args):
       with warnings.catch_warnings():  # Ignore empty slice warnings.
         warnings.simplefilter('ignore', category=RuntimeWarning)
         for name, values in metrics.items():
-          logger.scalar('train/' + name, np.nanmean(values, dtype=np.float64))
+          if name.endswith('_hist'):
+            logger.histogram('train/' + name, values)
+            logger.scalar('train/' + name + 'mean', np.nanmean(values, dtype=np.float64))
+            logger.scalar('train/' + name + 'std', np.nanstd(values, dtype=np.float64))
+          else:
+            logger.scalar('train/' + name, np.nanmean(values, dtype=np.float64))
           metrics[name].clear()
       logger.add(agent.report(batch[0]), prefix='report')
       logger.add(agent.report(next(dataset_eval)), prefix='eval')

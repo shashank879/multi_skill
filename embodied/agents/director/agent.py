@@ -2,6 +2,7 @@ import sys
 
 import embodied
 import ruamel.yaml as yaml
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras import mixed_precision as prec
 from tensorflow_probability import distributions as tfd
@@ -379,6 +380,174 @@ class ImagActorCritic(tfutils.Module):
     return loss, metrics
 
 
+class MultiSkillImagActorCritic(tfutils.Module):
+
+  def __init__(self, critics, scales, skill_shape, num_skills, config):
+    critics = {k: v for k, v in critics.items() if scales[k]}
+    for key, scale in scales.items():
+      assert not scale or key in critics, key
+    self.critics = {k: v for k, v in critics.items() if scales[k]}
+    self.scales = scales
+    self.num_skills = num_skills
+    self.config = config
+
+    self.act_space = {f'sk{i}': embodied.Space(
+        np.int32 if 'onehot' in config.gpa.skill_vae.encoder.dist else np.float32, skill_shape) for i in range(num_skills)}
+    self.act_space['choice'] = embodied.Space(np.int32, (num_skills,))
+    self.choice_grads = config.gpa.manager.actor_choice_grad
+    self.skill_grads = config.gpa.manager.actor_skill_grad
+    head_updates = {f'sk{i}': {'dist': (config.actor_dist_disc if self.act_space[f'sk{i}'].discrete else config.actor_dist_cont)} for i in range(num_skills)}
+    head_updates['choice'] = {'dist': 'onehot'}
+
+    act_shape = {k: v.shape for k, v in self.act_space.items()}
+    self.actor = nets.MLP(act_shape, **self.config.actor, head_updates=head_updates)
+
+    self.advnorm = tfutils.Normalize(**self.config.advnorm)
+    self.retnorms = {
+        k: tfutils.Normalize(**self.config.retnorm) for k in self.critics}
+    self.scorenorms = {
+        k: tfutils.Normalize(**self.config.scorenorm) for k in self.critics}
+    def get_actent(act_sp):
+      if self.config.actent_perdim:
+        shape = act_sp.shape[:-1] if act_sp.discrete else act_sp.shape
+        return tfutils.AutoAdapt(
+            shape, **self.config.actent, inverse=True)
+      else:
+        return tfutils.AutoAdapt((), **self.config.actent, inverse=True)
+    self.actent = {k: get_actent(v) for k, v in self.act_space.items()}
+    self.opt = tfutils.Optimizer('actor', **self.config.actor_opt)
+
+  def initial(self, batch_size):
+    return None
+
+  def policy(self, state):
+    outs = self.actor(state)
+    skill_outs = tfutils.StackedDistributions([outs[f'sk{i}'] for i in range(self.num_skills)])
+    outs['skill'] = skill_outs
+    return outs
+
+  def train(self, imagine, start, context):
+    def policy(state):
+      outs = self.policy(tf.nest.map_structure(tf.stop_gradient, state))
+      return tf.nest.map_structure(lambda s: s.sample(), outs)
+    with tf.GradientTape(persistent=True) as tape:
+      traj = imagine(policy, start, self.config.imag_horizon)
+    metrics = self.update(traj, tape)
+    return traj, metrics
+
+  def update(self, traj, tape=None):
+    tape = tape or tf.GradientTape()
+    metrics = {}
+    for key, critic in self.critics.items():
+      mets = critic.train(traj, self.actor)
+      metrics.update({f'{key}_{k}': v for k, v in mets.items()})
+    with tape:
+      score, mets = self.score(traj)
+      metrics.update(mets)
+      goal_traj = {'deter': traj['goal_opts'],
+                   'stoch': traj['goal_opts_stoch']}
+      goal_value, mets = self.value(goal_traj)
+      metrics.update(mets)
+      loss, mets = self.loss(traj, score, goal_value)
+      metrics.update(mets)
+      loss = loss.mean()
+    metrics.update(self.opt(tape, loss, self.actor))
+    return metrics
+
+  def score(self, traj):
+    scores = []
+    metrics = {}
+    for key, critic in self.critics.items():
+      ret, baseline = critic.score(traj, self.actor)
+      ret = self.retnorms[key](ret)
+      baseline = self.retnorms[key](baseline, update=False)
+      score = self.scorenorms[key](ret - baseline)
+      metrics[f'{key}_score_mean'] = score.mean()
+      metrics[f'{key}_score_std'] = score.std()
+      metrics[f'{key}_score_mag'] = tf.abs(score).mean()
+      metrics[f'{key}_score_max'] = tf.abs(score).max()
+      scores.append(score * self.scales[key])
+    score = self.advnorm(tf.reduce_sum(scores, 0))
+    return score, metrics
+
+  def value(self, states):
+    values = []
+    metrics = {}
+    for key, critic in self.critics.items():
+      value = critic.target_net(states).mean()
+      value = self.retnorms[key](value)
+      metrics[f'{key}_value_mean'] = value.mean()
+      metrics[f'{key}_value_std'] = value.std()
+      values.append(value * self.scales[key])
+    values = tf.reduce_sum(values, 0)
+    return values, metrics
+
+  def loss(self, traj, score, goal_value):
+    metrics = {}
+    traj = tf.nest.map_structure(tf.stop_gradient, traj)
+    policy = self.policy(traj)
+    metrics['manager_choice_hist'] = tf.argmax(policy['choice'].sample(), -1)
+    rl_loss, mets = self.rl_loss(traj, policy, score, goal_value)
+    losses = [rl_loss]
+    metrics.update(mets)
+    act_heads = set(self.act_space.keys())
+    if not self.config.gpa.manager.choice_entropic_loss:
+      act_heads.discard('choice')
+    for head in act_heads:
+      head_loss, mets = self.head_ent_loss(traj, policy, head)
+      losses.append(head_loss)
+      metrics.update({f'{head}_{k}': v for k, v in mets.items()})
+    return tf.add_n(losses) * traj['weight'][:-1], metrics
+
+  def rl_loss(self, traj, policy, score, goal_value):
+    metrics = {}
+    if self.skill_grads == 'backprop':
+      skill_loss = -score
+    elif self.skill_grads == 'reinforce':
+      skill_loss = -policy['skill'].log_prob(traj['skill'])
+      skill_loss = (skill_loss * traj['choice']).sum(-1)[:-1] * tf.stop_gradient(score)
+    else:
+      raise NotImplementedError(self.skill_grads)
+
+    if self.choice_grads == 'backprop':
+      choice_loss = -tf.reduce_sum(policy['choice'].sample() * tf.stop_gradient(goal_value), axis=-1)[:-1]
+    elif self.choice_grads == 'reinforce':
+      choice_loss = -policy['choice'].log_prob(traj['choice'])[:-1] * tf.stop_gradient(score)
+    else:
+      raise NotImplementedError(self.choice_grads)
+
+    metrics['skill_loss'] = skill_loss.mean()
+    metrics['choice_loss'] = choice_loss.mean()
+
+    return (skill_loss + choice_loss), metrics
+
+  def head_ent_loss(self, traj, policy, head):
+    metrics = {}
+    act_space = self.act_space[head]
+    shape = (
+      act_space.shape[:-1] if act_space.discrete
+      else act_space.shape)
+    if self.config.actent_perdim and len(shape) > 0:
+      assert isinstance(policy[head], tfd.Independent), type(policy[head])
+      ent = policy[head].distribution.entropy()[:-1]
+      if self.config.actent_norm:
+        lo = policy[head].minent / ent.shape[-1]
+        hi = policy[head].maxent / ent.shape[-1]
+        if not (hi == lo):
+          ent = (ent - lo) / (hi - lo)
+      ent_loss, mets = self.actent[head](ent)
+      ent_loss = ent_loss.sum(-1)
+    else:
+      ent = policy[head].entropy()[:-1]
+      if self.config.actent_norm:
+        lo, hi = policy[head].minent, policy[head].maxent
+        if not (hi == lo):
+          ent = (ent - lo) / (hi - lo)
+      ent_loss, mets = self.actent[head](ent)
+    metrics.update({f'actent_{k}': v for k, v in mets.items()})
+    return ent_loss, metrics
+
+
 class VFunction(tfutils.Module):
 
   def __init__(self, rewfn, config):
@@ -606,3 +775,114 @@ class TwinQFunction(tfutils.Module):
       for s, d in zip(self.net2.variables, self.target_net2.variables):
         d.assign(mix * s + (1 - mix) * d)
     self.updates.assign_add(1)
+
+
+class MultiSkillVAE(tfutils.Module):
+
+  def __init__(self, state_shape, act_shape, config):
+    self.state_shape = state_shape
+    self.act_shape = act_shape
+    self.skills = config.skills
+    self.num_vaes = len(self.skills)
+    self.config = config
+
+    self.feat = nets.Input(['deter'])
+    self.prior = tfutils.StackedDistributions([tfutils.get_prior(config.encoder, config.skill_shape)] * self.num_vaes)
+    self.act_prior = tfutils.StackedDistributions([tfutils.get_prior(config.encoder.update({'dist': 'onehot'}), config.skill_shape)] * self.num_vaes) if config.encoder.dist == 'relaxed_onehot' else self.prior
+    skill_shapes = {str(i): config.skill_shape for i in range(self.num_vaes)}
+    self.enc = nets.MLP(
+        skill_shapes, dims='context', **config.encoder)
+    input_layer_cfg = config.decoder.update(
+      {'dist': 'mse',
+       'layers': 1})
+    self.dec_input_layers = [nets.MLP(
+        None, dims='context', **input_layer_cfg) for _ in range(self.num_vaes)]
+    output_layer_cfg = config.decoder.update(
+      {'inputs': ['tensor'],
+       'layers': config.decoder.layers - 1})
+    self.dec = nets.MLP(
+        state_shape, **output_layer_cfg)
+    self.kl_norms = [tfutils.AutoAdapt((), **config.norm_kl) for _ in range(self.num_vaes)]
+    self.opt = tfutils.Optimizer('skill', **config.opt)
+
+  def train(self, traj):
+    metrics = {}
+    feat = self.feat(traj)
+    data = []
+    for i in range(self.num_vaes):
+      data.append(self.get_train_data(feat, traj, self.skills[i], metrics))
+    with tf.GradientTape() as tape:
+      loss, mets = self.loss(data)
+    metrics.update(self.opt(tape, loss, [self.enc, self.dec] + self.dec_input_layers))
+    metrics.update(mets)
+    return metrics
+
+  def loss(self, data):
+    losses = []
+    metrics = {}
+    for i in range(self.num_vaes):
+      context, goal, weight = data[i]
+      enc = self.enc({'goal': goal, 'context': context})[str(i)]
+      dec_input = self.dec_input_layers[i]({'skill': enc.sample(), 'context': context})
+      dec = self.dec(dec_input)
+      loss, mets = self.head_loss(enc, dec, context, goal, weight, i)
+      losses.append(loss)
+      metrics.update({f'sk{i}_{k}': v for k, v in mets.items()})
+    total_loss = tf.add_n(losses)
+    return total_loss, metrics
+
+  def get_train_data(self, feat, traj, skill, metrics):
+    if skill.startswith('T'):
+      skill_length = int(skill[1:])
+      assert feat.shape[0] >= skill_length, 'replay_length={} < skill_length={}'.format(feat.shape[0], skill_length)
+      # feat = feat.reshape([feat.shape[0] // skill_length, skill_length] + feat.shape[1:])
+      # context = feat[:, 0]
+      # goal = feat[:, -1]
+      context = feat[:-(skill_length - 1)]
+      goal = feat[(skill_length - 1):]
+      weight = tf.ones(context.shape[:-1])
+    elif skill == 'span':
+      context = feat[0]
+      goal = feat[-1]
+      weight = tf.ones(context.shape[:-1])
+    elif skill == 'var':
+      context = feat[:-self.config.train_skill_duration]
+      final_goal = feat[-1]
+      goal = tf.stack([final_goal] * context.shape[0], 0)
+      weight = tf.ones(context.shape[:-1])
+    else:
+      raise NotImplementedError(skill)
+    return tf.stop_gradient(context), tf.stop_gradient(goal), tf.stop_gradient(weight)
+
+  def head_loss(self, enc, dec, context, goal, weight, index):
+    metrics = {}
+    rec = -dec.log_prob(tf.stop_gradient(goal))
+    if self.config.kl_loss:
+      kl = tfd.kl_divergence(enc, self.prior._dists[index])
+      kl, mets = self.kl_norms[index](kl)
+      if self.skills[index] == 'var':
+        act_kl = tfd.kl_divergence(enc, self.act_prior._dists[index])
+        best_skillength = context.shape[0] + self.config.train_skill_duration - tf.argmin(act_kl, 0)
+        metrics['best_skillength_hist'] = best_skillength
+      metrics.update({f'kl_{k}': v for k, v in mets.items()})
+      assert rec.shape == kl.shape, (rec.shape, kl.shape)
+    else:
+      kl = 0.0
+    skill_loss = ((rec + kl) * weight).mean()
+    metrics['rec_mean'] = rec.mean()
+    metrics['rec_std'] = rec.std()
+    return skill_loss, metrics
+
+  def encode(self, inputs):
+    encs = self.enc(inputs)
+    return tfutils.StackedDistributions([encs[str(i)] for i in range(self.num_vaes)])
+
+  def decode(self, inputs: dict):
+    skills = tf.unstack(inputs['skill'], num=self.num_vaes, axis=-(len(self.act_shape) + 1))
+    dec_inputs = []
+    for i in range(self.num_vaes):
+      dec_input = self.dec_input_layers[i]({'context': inputs['context'], 'skill': skills[i]})
+      dec_inputs.append(dec_input)
+    dec_inputs = tf.stack(dec_inputs, axis=-(len(self.state_shape) + 1))
+    dec = self.dec(dec_inputs)
+    return dec

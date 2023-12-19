@@ -11,6 +11,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow.keras import mixed_precision as prec
 from tensorflow_probability import distributions as tfd
+from tensorflow_probability.python.distributions import kullback_leibler
 
 try:
   from tensorflow.python.distribute import values
@@ -41,6 +42,52 @@ def tensor(value):
     return value
   return tf.convert_to_tensor(value)
 tf.tensor = tensor
+
+
+try:
+  @kullback_leibler.RegisterKL(tfd.RelaxedOneHotCategorical, tfd.RelaxedOneHotCategorical)
+  def _kl_relaxedcategorical_relaxedcategorical(a, b, name=None):
+    """Calculate the batched KL divergence KL(a || b) with a, b RelaxedOneHotCategorical.
+
+    Args:
+      a: instance of a RelaxedOneHotCategorical distribution object.
+      b: instance of a RelaxedOneHotCategorical distribution object.
+      name: Python `str` name to use for created operations.
+        Default value: `None` (i.e., `'kl_relaxedcategorical_relaxedcategorical'`).
+
+    Returns:
+      Batchwise KL(a || b)
+    """
+    with tf.name_scope(name or 'kl_relaxedcategorical_relaxedcategorical'):
+      a_logits = a.logits_parameter()
+      b_logits = b.logits_parameter()
+      # sum(p ln(p / q))
+      kl = (tf.math.softmax(a_logits) * (tf.math.log_softmax(a_logits) - tf.math.log_softmax(b_logits)))
+      kl = tf.reduce_sum(kl, axis=-1)
+      return kl
+
+  @kullback_leibler.RegisterKL(tfd.RelaxedOneHotCategorical, tfd.OneHotCategorical)
+  def _kl_relaxedcategorical_categorical(a, b, name=None):
+    """Calculate the batched KL divergence KL(a || b) with a, b RelaxedOneHotCategorical and OneHotCategorical respec.
+
+    Args:
+      a: instance of a RelaxedOneHotCategorical distribution object.
+      b: instance of a OneHotCategorical distribution object.
+      name: Python `str` name to use for created operations.
+        Default value: `None` (i.e., `'kl_relaxedcategorical_categorical'`).
+
+    Returns:
+      Batchwise KL(a || b)
+    """
+    with tf.name_scope(name or 'kl_relaxedcategorical_categorical'):
+      a_logits = a.logits_parameter()
+      b_logits = b.logits_parameter()
+      # sum(p ln(p / q))
+      kl = (tf.math.softmax(a_logits) * (tf.math.log_softmax(a_logits) - tf.math.log_softmax(b_logits)))
+      kl = tf.reduce_sum(kl, axis=-1)
+      return kl
+except Exception as e:
+  pass
 
 
 def shuffle(tensor, axis):
@@ -120,6 +167,21 @@ def lambda_return(
   return returns
 
 
+def get_prior(layer_config, shape):
+  if layer_config.dist == 'onehot':
+    prior = OneHotDist(tf.zeros(shape))
+    prior = tfd.Independent(prior, len(shape) - 1)
+  elif layer_config.dist == 'relaxed_onehot':
+    prior = tfd.RelaxedOneHotCategorical(
+        layer_config.temp / 2.,
+        logits=tf.zeros(shape))
+    prior = tfd.Independent(prior, len(shape) - 1)
+  else:
+    prior = tfd.Normal(tf.zeros(shape), tf.ones(shape))
+    prior = tfd.Independent(prior, len(shape))
+  return prior
+
+
 class Module(tf.Module):
 
   def save(self):
@@ -149,7 +211,7 @@ class Optimizer(Module):
 
   def __init__(
       self, name, lr, opt='adam', eps=1e-5, clip=0.0, warmup=0, wd=0.0,
-      wd_pattern='kernel'):
+      wd_pattern='kernel', adam_beta1=.9, adam_beta2=.999):
     assert 0 <= wd < 1
     assert not clip or 1 <= clip
     self._name = name
@@ -163,7 +225,7 @@ class Optimizer(Module):
       self._lr = lambda: lr * tf.clip_by_value(
           self._updates.astype(tf.float32) / warmup, 0.0, 1.0)
     self._opt = {
-        'adam': lambda: tf.optimizers.Adam(self._lr, epsilon=eps),
+        'adam': lambda: tf.optimizers.Adam(self._lr, epsilon=eps, beta_1=adam_beta1, beta_2=adam_beta2),
         'sgd': lambda: tf.optimizers.SGD(self._lr),
         'momentum': lambda: tf.optimizers.SGD(self._lr, 0.9),
     }[opt]()
@@ -563,3 +625,40 @@ class Normalize:
     else:
       raise NotImplementedError(self._impl)
     return values
+
+
+class StackedDistributions:
+
+  def __init__(self, distributions):
+    self.batch_shape = distributions[0].batch_shape
+    self.event_shape = distributions[0].event_shape
+    for dist in distributions:
+      assert self.batch_shape == dist.batch_shape, "Found unequal batch shapes {} != {}".format(self.batch_shape, dist.batch_shape)
+      assert self.event_shape == dist.event_shape, "Found unequal event shapes {} != {}".format(self.event_shape, dist.event_shape)
+    self._dists = distributions
+
+  def sample(self, sample_shape=(), seed=None):
+    samples = []
+    for d in self._dists:
+      samples.append(d.sample(sample_shape, seed=seed))
+    return tf.stack(samples, axis=-(len(self.event_shape) + 1))
+
+  def prob(self, sample):
+    samples = tf.unstack(sample, axis=-(len(self.event_shape) + 1))
+    probs = []
+    for d, s in zip(self._dists, samples):
+      probs.append(d.prob(s))
+    return tf.stack(probs, axis=-1)
+
+  def log_prob(self, sample):
+    samples = tf.unstack(sample, axis=-(len(self.event_shape) + 1))
+    log_probs = []
+    for d, s in zip(self._dists, samples):
+      log_probs.append(d.log_prob(s))
+    return tf.stack(log_probs, axis=-1)
+
+  def kl_divergence(self, dist):
+    kls = []
+    for d1, d2 in zip(self._dists, dist._dists):
+      kls.append(tfd.kl_divergence(d1, d2))
+    return tf.stack(kls, axis=-1)

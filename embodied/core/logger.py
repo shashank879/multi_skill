@@ -27,10 +27,10 @@ class Logger:
     for name, value in dict(mapping).items():
       name = f'{prefix}/{name}' if prefix else name
       value = np.array(value)
-      if len(value.shape) not in (0, 2, 3, 4):
+      if len(value.shape) not in (0, 1, 2, 3, 4):
         raise ValueError(
             f"Shape {value.shape} for name '{name}' cannot be "
-            "interpreted as scalar, image, or video.")
+            "interpreted as scalar, image, histogram, or video.")
       self._metrics.append((step, name, value))
 
   def scalar(self, name, value):
@@ -40,6 +40,9 @@ class Logger:
     self.add({name: value})
 
   def video(self, name, value):
+    self.add({name: value})
+
+  def histogram(self, name, value):
     self.add({name: value})
 
   def write(self, fps=False):
@@ -161,7 +164,9 @@ class TensorBoardOutput(AsyncOutput):
           self._logdir, max_queue=1000)
     self._writer.set_as_default()
     for step, name, value in summaries:
-      if len(value.shape) == 0:
+      if name.endswith('_hist'):
+        tf.summary.histogram(name, value, step)
+      elif len(value.shape) == 0:
         tf.summary.scalar(name, value, step)
       elif len(value.shape) == 2:
         tf.summary.image(name, value, step)
