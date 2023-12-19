@@ -37,17 +37,17 @@ Evaluated on a few tasks from Deepmind Control Suite.
 
 ## Frames from acting
 
-```walker_walk```
+### ```walker_walk```
 ![](./media/mrsk_walker_walk_grid.png)
 
-```walker_run```
+### ```walker_run```
 ![](./media/mrsk_walker_run_grid.png)
 
-```quadruped_run```
+### ```quadruped_run```
 ![](./media/mrsk_quadruped_run_grid.png)
 
-```cheetah_run```
+### ```cheetah_run```
 ![](./media/mrsk_cheetah_run_grid.png)
 
-```cartpole_swingup```
+### ```cartpole_swingup```
 ![](./media/mrsk_cartpole_swingup_grid.png)
